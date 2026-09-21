@@ -1,0 +1,96 @@
+name: Build CLI SEA binaries
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-cli-sea.yml
+      - apps/zcode-cli/**
+      - packages/**
+      - scripts/**
+      - third-party/native-search/**
+      - mise.toml
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux-x64
+          - linux-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+
+      - name: Install CLI and SEA asset dependency closures
+        run: >-
+          pnpm install
+          --filter '@zcode/cli...'
+          --filter '@zcode/node-repl-host...'
+          --filter '@zcode/browser-use-plugin...'
+          --filter zcode
+          --frozen-lockfile
+
+      - name: Build CLI dependencies
+        run: |
+          pnpm --filter '@zcode/cli^...' build
+          pnpm --filter '@zcode/node-repl-host^...' build
+          pnpm --filter '@zcode/browser-use-plugin^...' build
+
+      - name: Build shared package artifacts
+        run: pnpm exec tsc -b packages/shared
+
+      - name: Build CLI workspace
+        run: |
+          pnpm --filter @zcode/node-repl-host build
+          pnpm --filter @zcode/browser-use-plugin build
+          pnpm --filter @zcode/cli build
+
+      - name: Build SEA binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: pnpm --filter @zcode/cli sea -- --target "$TARGET"
+
+      - name: Smoke-test and checksum binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="apps/zcode-cli/packages/cli/dist/zcode-${TARGET}"
+          test -s "$binary"
+          chmod +x "$binary"
+          if [ "$TARGET" = "linux-x64" ]; then
+            ZCODE_STORAGE_DIR="$RUNNER_TEMP/zcode-storage" "$binary" --version
+          fi
+          sha256sum "$binary" > "${binary}.sha256"
+
+      - name: Upload SEA binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: zcode-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            apps/zcode-cli/packages/cli/dist/zcode-${{ matrix.target }}
+            apps/zcode-cli/packages/cli/dist/zcode-${{ matrix.target }}.sha256
