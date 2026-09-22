@@ -1,0 +1,128 @@
+name: Build Web server bundles
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-web.yml
+      - apps/zcode-cli/**
+      - packages/**
+      - scripts/**
+      - third-party/native-search/**
+      - mise.toml
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux-x64
+          - linux-arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24.14.0
+          cache: pnpm
+
+      # CLI 依赖闭包与 build-cli-sea.yml 保持一致；server/web 闭包复用同一次安装。
+      # 不安装 @zcode/desktop，整个构建不触碰 Electron。
+      - name: Install CLI, server and web dependency closures
+        run: >-
+          pnpm install
+          --filter '@zcode/cli...'
+          --filter '@zcode/node-repl-host...'
+          --filter '@zcode/browser-use-plugin...'
+          --filter '@zcode/server...'
+          --filter '@zcode/web...'
+          --filter zcode
+          --frozen-lockfile
+
+      - name: Build CLI dependencies
+        run: |
+          pnpm --filter '@zcode/cli^...' build
+          pnpm --filter '@zcode/node-repl-host^...' build
+          pnpm --filter '@zcode/browser-use-plugin^...' build
+
+      - name: Build shared package artifacts
+        run: pnpm exec tsc -b packages/shared
+
+      - name: Build CLI workspace
+        run: |
+          pnpm --filter @zcode/node-repl-host build
+          pnpm --filter @zcode/browser-use-plugin build
+          pnpm --filter @zcode/cli build
+
+      - name: Build CLI SEA binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: pnpm --filter @zcode/cli sea -- --target "$TARGET"
+
+      - name: Build web server bundle and static UI
+        run: |
+          pnpm --filter @zcode/server build:remote:http
+          pnpm --filter @zcode/web build
+
+      - name: Pack web release directory
+        env:
+          TARGET: ${{ matrix.target }}
+        run: node scripts/pack-web-release.mjs --target "$TARGET"
+
+      - name: Smoke-test release (x64 only)
+        if: matrix.target == 'linux-x64'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          release_dir="release/zcode-web-${TARGET}"
+          test -x "${release_dir}/start.sh"
+          PORT=3199 ZCODE_SERVER_HOST=127.0.0.1 "${release_dir}/start.sh" &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null "http://127.0.0.1:3199/"; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf -o /dev/null "http://127.0.0.1:3199/"
+          curl -sf "http://127.0.0.1:3199/" | grep -q "<!doctype html"
+          echo "web server smoke test passed"
+          kill "$server_pid"
+          trap - EXIT
+
+      - name: Create tarball and checksum
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          release_dir="release/zcode-web-${TARGET}"
+          tar -czf "zcode-web-${TARGET}.tar.gz" -C release "zcode-web-${TARGET}"
+          sha256sum "zcode-web-${TARGET}.tar.gz" > "zcode-web-${TARGET}.tar.gz.sha256"
+
+      - name: Upload web server bundle
+        uses: actions/upload-artifact@v6
+        with:
+          name: zcode-web-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            zcode-web-${{ matrix.target }}.tar.gz
+            zcode-web-${{ matrix.target }}.tar.gz.sha256

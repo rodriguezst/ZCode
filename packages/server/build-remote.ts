@@ -8,6 +8,43 @@ const { version } = JSON.parse(readFileSync("../../package.json", "utf-8"));
 const { content: zcodeBuiltinProviderConfigJson } = await loadBuiltinProviderConfig();
 
 /**
+ * remote bundle 的构建 target。stdio 供桌面远端 SSH 部署使用（deploy.ts 只消费
+ * zcode-server.cjs）；http 供 headless Web 发布包使用（zcode-web-server.cjs，
+ * 由 scripts/pack-web-release.mjs 组装进 tar.gz）。两者共用同一套插件、define
+ * 与校验链，仅入口和产物名不同。
+ */
+type RemoteEntryTarget = "stdio" | "http";
+
+const REMOTE_ENTRY_TARGETS: Record<
+  RemoteEntryTarget,
+  { entry: string; outfile: string; label: string }
+> = {
+  stdio: {
+    entry: "src/entry-stdio.ts",
+    outfile: "dist/remote/zcode-server.cjs",
+    label: "stdio",
+  },
+  http: {
+    entry: "src/entry-http.ts",
+    outfile: "dist/remote/zcode-web-server.cjs",
+    label: "web http",
+  },
+};
+
+function parseTargetArg(): RemoteEntryTarget {
+  const arg = process.argv[2];
+  if (arg === undefined) {
+    return "stdio";
+  }
+  if (!(arg in REMOTE_ENTRY_TARGETS)) {
+    throw new Error(
+      `Unknown remote entry target "${arg}". Expected one of: ${Object.keys(REMOTE_ENTRY_TARGETS).join(", ")}.`,
+    );
+  }
+  return arg as RemoteEntryTarget;
+}
+
+/**
  * Let esbuild bundle node-pty's JS code normally, but keep .node native
  * addon files as external requires. node-pty's loadNativeModule() searches
  * for `./build/Release/pty.node` relative to itself, which matches our
@@ -27,10 +64,13 @@ const nativeAddonPlugin: Plugin = {
   },
 };
 
+const target = parseTargetArg();
+const targetConfig = REMOTE_ENTRY_TARGETS[target];
+
 const buildResult = await build({
-  entryPoints: ["src/entry-stdio.ts"],
+  entryPoints: [targetConfig.entry],
   bundle: true,
-  outfile: "dist/remote/zcode-server.cjs",
+  outfile: targetConfig.outfile,
   platform: "node",
   format: "cjs",
   target: "node22",
@@ -49,10 +89,10 @@ const buildResult = await build({
   metafile: true,
 });
 
-const remoteBundleSource = readFileSync("dist/remote/zcode-server.cjs", "utf-8");
+const remoteBundleSource = readFileSync(targetConfig.outfile, "utf-8");
 const bundledInputs = Object.keys(buildResult.metafile.inputs);
 validateRemoteServerBundle({ bundledInputs, source: remoteBundleSource });
 // 修复：remote 单文件 bundle 内联第三方代码，dist/remote 也必须附完整声明。
 await stageThirdPartyNotices("dist/remote");
 
-console.log("Built dist/remote/zcode-server.cjs");
+console.log(`Built ${targetConfig.outfile} (${targetConfig.label} entry)`);
